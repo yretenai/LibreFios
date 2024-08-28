@@ -61,17 +61,18 @@ public sealed class PSARC : IDisposable {
 
 		// read entries in one go
 		var entries = MemoryPool<PSARCFileEntry>.Shared.Rent(Header.FAT.Count);
-		var entriesSpan = MemoryMarshal.AsBytes(entries.Memory.Span[..Header.FAT.Count]);
-		BaseStream.ReadExactly(entriesSpan);
+		var entriesSpan = entries.Memory.Span[..Header.FAT.Count];
+		var entriesBytes = MemoryMarshal.AsBytes(entriesSpan);
+		BaseStream.ReadExactly(entriesBytes);
 
 		// amortize it into a dictionary.
 		FileEntries = new Dictionary<PSARCHash, PSARCFileEntry>(Header.FAT.Count);
-		foreach (var entry in entries.Memory.Span[..Header.FAT.Count]) {
+		foreach (var entry in entriesSpan) {
 			FileEntries[entry.Hash] = entry;
 		}
 
 		// read the compression block list in one go
-		var blockSizeBufferSize = Header.FAT.Size - entriesSpan.Length;
+		var blockSizeBufferSize = Header.FAT.Size - entriesBytes.Length;
 		BlockSizeBuffer = MemoryPool<byte>.Shared.Rent(blockSizeBufferSize);
 		BaseStream.ReadExactly(BlockSizeBuffer.Memory.Span[..blockSizeBufferSize]);
 
@@ -121,6 +122,7 @@ public sealed class PSARC : IDisposable {
 		var dataBuffer = rentedDataBuffer.Memory.Span[..Header.BlockSize];
 		var blockIndex = file.BlockIndex;
 		var resultBuffer = new PSARCMemoryBuffer(MemoryPool<byte>.Shared.Rent((int) file.DecompressedSize), (int) file.DecompressedSize);
+		var resultSpan = resultBuffer.WritableData;
 
 		var fill = (int) file.DecompressedSize;
 		while (fill > 0) {
@@ -148,7 +150,7 @@ public sealed class PSARC : IDisposable {
 
 			// if the block is exactly the same size as the remaining buffer, it's not compressed (usually.)
 			if (blockSlice.Length == fill || blockSize == 0) {
-				blockSlice.CopyTo(resultBuffer.WritableData[(resultBuffer.Length - fill)..]);
+				blockSlice.CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
 				fill -= blockSlice.Length;
 				continue;
 			}
@@ -157,7 +159,7 @@ public sealed class PSARC : IDisposable {
 				// this is not actually a valid compression type, but here for completeness
 				case PSARCCompressionType.Invalid:
 				case PSARCCompressionType.None: {
-					blockSlice.CopyTo(resultBuffer.WritableData[(resultBuffer.Length - fill)..]);
+					blockSlice.CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
 					fill -= blockSlice.Length;
 					break;
 				}
@@ -174,7 +176,7 @@ public sealed class PSARC : IDisposable {
 					}
 
 					// copy the decompressed data into the resulting buffer
-					dataBuffer[..n].CopyTo(resultBuffer.WritableData[(resultBuffer.Length - fill)..]);
+					dataBuffer[..n].CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
 					fill -= n;
 
 					break;
@@ -198,20 +200,20 @@ public sealed class PSARC : IDisposable {
 						n = (int) uncompressedSize;
 					}
 
-					dataBuffer[..n].CopyTo(resultBuffer.WritableData[(resultBuffer.Length - fill)..]);
+					dataBuffer[..n].CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
 					fill -= n;
 					break;
 				}
 				case PSARCCompressionType.Oodle: { // note: provide oo2core.dll (rename it)
 					var n = Oodle.Decompress(rentedBlockBuffer.Memory[..Header.BlockSize], rentedDataBuffer.Memory[..Header.BlockSize]);
-					dataBuffer[..n].CopyTo(resultBuffer.WritableData[(resultBuffer.Length - fill)..]);
+					dataBuffer[..n].CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
 					fill -= n;
 					break;
 				}
 				case PSARCCompressionType.ZStandard: { // note: provide libzstd.dll
 					using var zstd = new ZStandard();
 					var n = (int) zstd.Decompress(rentedBlockBuffer.Memory[..Header.BlockSize], rentedDataBuffer.Memory[..Header.BlockSize]);
-					dataBuffer[..n].CopyTo(resultBuffer.WritableData[(resultBuffer.Length - fill)..]);
+					dataBuffer[..n].CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
 					fill -= n;
 					break;
 				}
