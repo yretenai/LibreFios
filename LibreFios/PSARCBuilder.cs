@@ -17,7 +17,12 @@ public sealed class PSARCBuilder : IDisposable {
 
 		var reverse = Archive.BuildReversePaths();
 		foreach (var (hash, entry) in Archive.FileEntries) {
-			Files.Add(new PSARCTempFile(hash, reverse.GetValueOrDefault(hash), Archive.OpenFile(entry)));
+			var buffer = Archive.OpenFile(entry);
+			if (buffer is not PSARCMemoryBuffer memoryBuffer) {
+				continue;
+			}
+
+			Files.Add(new PSARCTempFile(hash, reverse.GetValueOrDefault(hash), memoryBuffer));
 		}
 	}
 

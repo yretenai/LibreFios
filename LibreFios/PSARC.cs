@@ -28,6 +28,8 @@ internal static class StreamPolyfillExtensions {
 #endif
 
 public sealed class PSARC : IDisposable {
+	private static readonly char[] LineSeparators = ['\n', (char) 0];
+
 	public PSARC(Stream stream) {
 		BaseStream = stream;
 
@@ -72,16 +74,16 @@ public sealed class PSARC : IDisposable {
 		}
 
 		// read the compression block list in one go
-		var blockSizeBufferSize = Header.FAT.Size - entriesBytes.Length;
-		BlockSizeBuffer = MemoryPool<byte>.Shared.Rent(blockSizeBufferSize);
-		BaseStream.ReadExactly(BlockSizeBuffer.Memory.Span[..blockSizeBufferSize]);
+		BlockSizeBufferSize = Header.FAT.Size - entriesBytes.Length;
+		BlockSizeBuffer = MemoryPool<byte>.Shared.Rent(BlockSizeBufferSize);
+		BaseStream.ReadExactly(BlockSizeBuffer.Memory.Span[..BlockSizeBufferSize]);
 
 		// read manifest (if it exists)
 		// manifest has no hash.
 		using var manifest = OpenFile(default(PSARCHash));
-		if (manifest.Length > 0) {
+		if (manifest.Length > 0 && manifest.Data[0] != 0) {
 			// todo: check if this always matches the file order, it might be possible to just skip md5-ing the path.
-			foreach (var filePath in Encoding.ASCII.GetString(manifest.Data).Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)) {
+			foreach (var filePath in Encoding.ASCII.GetString(manifest.Data).Split(LineSeparators, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)) {
 				// normalize paths.
 				// todo: can relative paths start with '/'?
 				Manifest[filePath.Replace('\\', '/')] = new PSARCHash(Header.ArchiveFlags.HasFlagFast(PSARCArchiveFlags.CaseInsensitivePaths) ? filePath.ToUpperInvariant() : filePath);
@@ -91,8 +93,8 @@ public sealed class PSARC : IDisposable {
 
 	// allocate 255 bytes for random slop to avoid making allocations over and over and over again.
 	internal byte[] ScratchPad { get; } = ArrayPool<byte>.Shared.Rent(byte.MaxValue);
-
 	internal PSARCHeader Header { get; set; }
+	internal int BlockSizeBufferSize { get; set; }
 	internal IMemoryOwner<byte> BlockSizeBuffer { get; set; }
 
 	public Stream BaseStream { get; set; }
@@ -106,7 +108,7 @@ public sealed class PSARC : IDisposable {
 		BlockSizeBuffer.Dispose();
 	}
 
-	internal PSARCMemoryBuffer OpenFile(PSARCFileEntry file) {
+	internal IPSARCBuffer OpenFile(PSARCFileEntry file) {
 		// unfortunately, Span<T> only holds 2 GB.
 		// it's not impossible to refactor this support larger (i.e. a PSARCMemoryStream implementation of IPSARCBuffer)
 		if (file.DecompressedSize > int.MaxValue) {
@@ -135,8 +137,8 @@ public sealed class PSARC : IDisposable {
 			if (Header.ArchiveFlags.HasFlagFast(PSARCArchiveFlags.EncryptedFiles)) {
 				// we've never seen this file or this implemented in any implementation.
 				// but we've seen the flag in two places.
-				var key = BlockSizeBuffer.Memory.Span[^20..^10];
-				var iv = BlockSizeBuffer.Memory.Span[^10..];
+				var key = BlockSizeBuffer.Memory.Span.Slice(BlockSizeBufferSize - 0x20, 0x10);
+				var iv = BlockSizeBuffer.Memory.Span.Slice(BlockSizeBufferSize - 0x10, 0x10);
 				using var aes = Aes.Create();
 				key.CopyTo(ScratchPad);
 				aes.Key = ScratchPad[..0x10];
@@ -164,6 +166,10 @@ public sealed class PSARC : IDisposable {
 					break;
 				}
 				case PSARCCompressionType.ZLib: {
+					if (!IsZlib(blockSlice)) { // encrypted
+						return IPSARCBuffer.Empty;
+					}
+
 					// calculate how many bytes we'll be reading
 					var n = Math.Min(fill, Header.BlockSize);
 
@@ -182,6 +188,10 @@ public sealed class PSARC : IDisposable {
 					break;
 				}
 				case PSARCCompressionType.LZMA: { // note: find a better lzma implementation
+					if (!IsLZMA(blockSlice)) { // encrypted
+						return IPSARCBuffer.Empty;
+					}
+
 					var lzma = new LZMADecoder();
 					var uncompressedSize = BinaryPrimitives.ReadUInt64LittleEndian(blockBuffer[5..]);
 					blockBuffer[..5].CopyTo(ScratchPad);
@@ -205,12 +215,20 @@ public sealed class PSARC : IDisposable {
 					break;
 				}
 				case PSARCCompressionType.Oodle: { // note: provide oo2core.dll (rename it)
+					if (!IsOodle(blockSlice)) { // encrypted
+						return IPSARCBuffer.Empty;
+					}
+
 					var n = Oodle.Decompress(rentedBlockBuffer.Memory[..Header.BlockSize], rentedDataBuffer.Memory[..Header.BlockSize]);
 					dataBuffer[..n].CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
 					fill -= n;
 					break;
 				}
 				case PSARCCompressionType.ZStandard: { // note: provide libzstd.dll
+					if (!IsZStandard(blockSlice)) { // encrypted
+						return IPSARCBuffer.Empty;
+					}
+
 					using var zstd = new ZStandard();
 					var n = (int) zstd.Decompress(rentedBlockBuffer.Memory[..Header.BlockSize], rentedDataBuffer.Memory[..Header.BlockSize]);
 					dataBuffer[..n].CopyTo(resultSpan[(resultBuffer.Length - fill)..]);
@@ -223,6 +241,11 @@ public sealed class PSARC : IDisposable {
 
 		return resultBuffer;
 	}
+
+	private static bool IsZlib(Span<byte> span) => span[0] == 0x78 && span[1] > 0x1F;
+	private static bool IsLZMA(Span<byte> span) => span[0] is 0x5D or 0x2C;
+	private static bool IsOodle(Span<byte> span) => (span[0] & 0x3F) == 0xC;
+	private static bool IsZStandard(Span<byte> span) => span[1] == 0xb5 && span[2] == 0x2f && span[3] == 0xfd;
 
 	public IPSARCBuffer OpenFile(PSARCHash hash) => FileEntries.TryGetValue(hash, out var file) ? OpenFile(file) : IPSARCBuffer.Empty;
 	public IPSARCBuffer OpenFile(string path) => Manifest.TryGetValue(path.Replace('\\', '/'), out var hash) ? OpenFile(hash) : OpenFile(new PSARCHash(Header.ArchiveFlags.HasFlagFast(PSARCArchiveFlags.CaseInsensitivePaths) ? path.ToUpperInvariant() : path));
