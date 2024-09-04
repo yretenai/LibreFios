@@ -7,9 +7,7 @@ namespace LibreFios.Compression;
 
 [SuppressMessage("ReSharper", "PartialTypeWithSinglePart")]
 internal static partial class Oodle {
-	static Oodle() {
-		BlockDecoderMemorySizeNeeded = NativeMethods.OodleLZDecoder_MemorySizeNeeded(OodleLZ_Compressor.Invalid, -1);
-	}
+	static Oodle() => BlockDecoderMemorySizeNeeded = NativeMethods.OodleLZDecoder_MemorySizeNeeded(OodleLZ_Compressor.Invalid, -1);
 
 	internal static int BlockDecoderMemorySizeNeeded { get; }
 
